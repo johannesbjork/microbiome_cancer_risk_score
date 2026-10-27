@@ -1,0 +1,466 @@
+---
+title: "microbiome_cancer_risk_score"
+output: html_document
+date: "2026-09-18"
+author: "Johannes Bjork"
+---
+
+```{r}
+
+.libPaths(c(.libPaths(), normalizePath("r_libs")))
+
+library(dplyr)
+library(tidyverse)
+library(driver)
+#library(compositions)
+#library(zCompositions)
+library(glmnet)
+library(survival)
+library(ggsurvfit)
+library(broom)
+
+```
+
+```{r}
+
+# Load microbiome data
+microbiome_ftbl <-  read.csv('DAG3_merged_metaphlan4_2024Sep.csv', row.names=1)
+rownames(microbiome_ftbl) <- gsub(rownames(microbiome_ftbl), pattern="_metaphlan", replacement="")
+microbiome_ftbl <- microbiome_ftbl[,grepl(x = colnames(microbiome_ftbl), pattern = paste(c("t__","UNCLASSIFIED"), collapse = "|"))]
+
+# Load metadata
+meta_case_control <- read.csv('meta_case_control.csv')
+
+# Subset to the focal study population (individuals >=18 years)
+microbiome_ftbl <- microbiome_ftbl[meta_case_control$DAG3_sampleID,]
+
+```
+
+
+```{r}
+
+print("# Generate 100 stratified 70/30 train-test splits preserving case-control proportions")
+
+R = 100
+
+train_test_meta_ls <- lapply(seq_len(R), function(i) { list(train = NULL, test = NULL) })
+train_test_ftbl_ls <- lapply(seq_len(R), function(i) { list(train = NULL, test = NULL) })
+
+for (r in seq_len(R)) {
+  set.seed(1000 + r)
+  
+  print(r)
+  
+  train_num_cases <- floor(table(meta_case_control$event)*0.7)[2]
+  train_num_ctrl <- floor(table(meta_case_control$event)*0.7)[1]
+  
+  train_case_idx <- sample(1:length(meta_case_control$event[meta_case_control$event==1]), train_num_cases)
+  train_ctrl_idx <- sample(1:length(meta_case_control$event[meta_case_control$event==0]), train_num_ctrl)
+  
+  train_meta <- bind_rows( 
+    meta_case_control[meta_case_control$event==1,][train_case_idx,],
+    meta_case_control[meta_case_control$event==0,][train_ctrl_idx,]
+  )
+  
+  test_meta <- bind_rows( 
+    meta_case_control[meta_case_control$event==1,][-train_case_idx,],
+    meta_case_control[meta_case_control$event==0,][-train_ctrl_idx,]
+  )
+  
+  train_test_meta_ls[[r]]$train <- train_meta
+  train_test_meta_ls[[r]]$test <- test_meta
+  
+  train_ftbl0 <- data.frame(microbiome_ftbl[rownames(microbiome_ftbl) %in% train_meta$DAG3_sampleID,])
+  train_ftbl0 <- driver::miniclo(train_ftbl0) # Keep UNCLASSIFIED in for normalization
+  train_ftbl0 <- train_ftbl0[,-1] # Remove UNCLASSIFIED
+  train_ftbl0 <- train_ftbl0[match(train_meta$DAG3_sampleID, rownames(train_ftbl0)),] # order rows in ftbl based on metadata
+  
+  test_ftbl0 <- data.frame(microbiome_ftbl[rownames(microbiome_ftbl) %in% test_meta$DAG3_sampleID,])
+  test_ftbl0 <- driver::miniclo(test_ftbl0) # Keep UNCLASSIFIED in for normalization
+  test_ftbl0 <- test_ftbl0[,-1] # Remove UNCLASSIFIED
+  test_ftbl0 <- test_ftbl0[match(test_meta$DAG3_sampleID, rownames(test_ftbl0)),] # order rows in ftbl based on metadata
+  
+  train_test_ftbl_ls[[r]]$train <- train_ftbl0
+  train_test_ftbl_ls[[r]]$test <- test_ftbl0
+  
+}
+
+```
+
+```{r}
+
+print("# Function to select SGBs with the largest positive and negative log prevalence ratios between incident cancer cases and controls")
+
+select_features_logPR_topK <- function(ftbl, 
+                                       meta,
+                                       min_prev = 0.1,
+                                       K_pos = 150,   # case-enriched
+                                       K_neg = 150,   # control-enriched
+                                       eps = 0.01,
+                                       min_ctrl_pos = 0) {
+  
+  case_idx <- meta$event == 1L
+  ctrl_idx <- meta$event == 0L
+  stopifnot(sum(case_idx) > 1, sum(ctrl_idx) > 1)
+  
+  X <- (as.matrix(ftbl) > 0) * 1L
+  prev_cases <- colMeans(X[case_idx, , drop=FALSE])
+  prev_ctrls <- colMeans(X[ctrl_idx, , drop=FALSE])
+  
+  # optional: stabilize denominator by requiring minimum number of positive controls
+  if (min_ctrl_pos > 0) {
+    ctrl_count <- colSums(X[ctrl_idx, , drop=FALSE])
+    ok_ctrl <- ctrl_count >= min_ctrl_pos
+  } else {
+    ok_ctrl <- rep(TRUE, ncol(X)); names(ok_ctrl) <- colnames(X)
+  }
+  
+  prev_max <- pmax(prev_cases, prev_ctrls)
+  ok_prev <- prev_max >= min_prev
+  
+  logPR <- log((prev_cases + eps) / (prev_ctrls + eps))
+  
+  # candidates
+  cand <- names(prev_cases)[ok_prev & ok_ctrl]
+  
+  # top-K helpers
+  topK <- function(x, K, decreasing=TRUE) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0) return(character())
+    K <- min(K, length(x))
+    names(sort(x, decreasing=decreasing))[seq_len(K)]
+  }
+  
+  feats_pos <- topK(logPR[cand][logPR[cand] > 0], K_pos, decreasing=TRUE) # most positive
+  feats_neg <- topK(logPR[cand][logPR[cand] < 0], K_neg, decreasing=FALSE)# most negative
+  
+  keep_feats <- union(feats_pos, feats_neg)
+  
+  list(
+    keep_feats = keep_feats,
+    prev_cases = prev_cases,
+    prev_ctrls = prev_ctrls,
+    logPR = logPR
+  )
+}
+
+
+print("# Dimensionality-reduction: retain the 100 SGBs with the largest positive and negative log prevalence ratios (case- and control-enriched, respectively)")
+
+selected_feats <- vector("list", R)
+pr <- vector("list", R)
+
+for (r in seq_len(R)) {
+  print(r)
+  
+  train_meta <- train_test_meta_ls[[r]]$train
+  train_ftbl <- train_test_ftbl_ls[[r]]$train
+  
+  pr_r <- select_features_logPR_topK(meta = train_meta, ftbl = train_ftbl, min_prev = 0.1, eps = 0.01, min_ctrl_pos = 5, K_pos = 100, K_neg = 100)
+  
+  pr[[r]] <- pr_r
+  selected_feats[[r]] <- pr_r$keep_feats
+
+}
+
+```
+
+```{r}
+
+print("# Train elastic net Cox models")
+
+# For each of the 100 outer train-test splits:
+# 1. Binarize the SGBs selected within the training set
+# 2. Fit an elastic net Cox model using 5-fold internal cross-validation
+# 3. Extract features with non-zero coefficients at lambda.min
+# 4. Calculate risk scores in the training and held-out test sets
+# 5. Standardize test scores using the corresponding training-set mean and SD
+
+nonzero_feats <- vector("list", R)
+coefs_ls <- vector("list", R)
+train_test_score <- lapply(seq_len(R), function(i) { list(train_score = NULL, test_score = NULL) })
+
+for (r in seq_len(R)) {   
+  
+  set.seed(2000 + r)
+  
+  print(r)
+  
+  train_meta <- train_test_meta_ls[[r]]$train
+  train_ftbl <- train_test_ftbl_ls[[r]]$train
+  
+  test_ftbl <- train_test_ftbl_ls[[r]]$test
+  test_meta <- train_test_meta_ls[[r]]$test
+  
+  train_df <- data.frame(train_ftbl) %>% 
+    rownames_to_column("DAG3_sampleID") %>% 
+    left_join(train_meta)
+  
+  test_df <- data.frame(test_ftbl) %>% 
+    rownames_to_column("DAG3_sampleID") %>% 
+    left_join(test_meta)
+  
+  keep_feats <- selected_feats[[r]]
+  
+  # Elastic net - train model
+  x_train <- as.matrix(train_df[, keep_feats, drop = FALSE])
+  x_train <- (x_train > 0) * 1L # binary
+  y_train <- Surv(train_df$time_to_event, train_df$event)
+
+  nfolds=5
+  foldid <- sample(rep(1:nfolds, length.out = nrow(x_train)))
+
+  fit <- cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "cox",
+    alpha = 0.5,
+    standardize = TRUE,
+    type.measure = "C",
+    foldid = foldid
+  )
+  
+  # Linear predictor and non-zero coefs
+  beta <- as.matrix(coef(fit, s = "lambda.min"))
+  nz <- setdiff(rownames(beta)[beta[,1] != 0], "(Intercept)")
+  nonzero_feats[[r]] <- nz
+
+  # Calculate score on both train and test data
+  x_train_nz <- x_train[, nz, drop = FALSE]  
+  
+  x_test <- as.matrix(test_df[, keep_feats, drop = FALSE])
+  x_test <- (x_test > 0) * 1L
+  x_test_nz <- x_test[,  nz, drop = FALSE]
+  
+  lp_train_raw <- as.numeric(x_train_nz %*% beta[nz, 1])
+  lp_test_raw <- as.numeric(x_test_nz  %*% beta[nz, 1])
+  
+  # Standardize using train mean/sd
+  mu <- mean(lp_train_raw)
+  sdv <- sd(lp_train_raw)
+  if (sdv == 0 || is.na(sdv)) next
+
+  train_df$risk_score <- (lp_train_raw - mu) / sdv
+  test_df$risk_score <- (lp_test_raw  - mu) / sdv
+  
+  train_test_score[[r]]$train_score <- as.numeric(train_df$risk_score)
+  train_test_score[[r]]$test_score <- as.numeric(test_df$risk_score)
+  
+  coefs_ls[[r]] <- beta[,1]
+
+}
+
+```
+
+```{r}
+
+print("# Function to summarize the stability of the estimated coefficients across iterations")
+
+summarize_coefs <- function(
+    coefs_ls, 
+    sign_thresh = 0.9, # Required proportion of same-sign non-zero coefficients
+    zero_tol = 1e-8 # Values with absolute magnitude <= this are treated as zero
+) {
+  
+  # Collect all unique SGBs that received a coefficients in any iteration
+  all_feats <- unique(unlist(lapply(coefs_ls, names)))
+  
+  # Number of re-sampling iterations 
+  n_iter <- length(coefs_ls)
+  
+  # Create a feature-by-iteration coefficient matrix
+  # The matrix is initialized with zeroes, so a feature is absent from an iteration is treated as having a coefficient of zero in that iteration
+  
+  coef_mat <- matrix(
+    0,                    
+    nrow = length(all_feats),
+    ncol = n_iter,
+    dimnames = list(
+      all_feats, 
+      paste0("iter_", seq_len(n_iter))
+    )
+  )
+  
+  # Populate the matrix with the estimated non-zero coefficients from each iteration
+  for (i in seq_len(n_iter)) {
+    cf <- coefs_ls[[i]]
+    
+    # Leave the corresponding matrix column as zero if no coefficient were retained in this iteration
+    if (is.null(cf) || length(cf) == 0) next
+    
+    feats <- names(cf)
+    vals  <- as.numeric(cf)
+    
+    coef_mat[feats, i] <- vals
+  }
+  
+  # Return coefficicents that are meaningfully different from zero
+  # Tiny values within +/- zero_tol are treated as numerical zeros
+  get_nz <- function(x) {
+    x[abs(x) > zero_tol]
+  }
+  
+  # Selection frequency
+  # Proportion of all iterations in which the feature had a coefficient with an absolute value > zero_tol
+  selection_frequency <- apply(coef_mat, 1, function(x) {
+    mean(abs(x) > zero_tol)
+  })
+  
+  # Overall median coefficient
+  # Median beta across all iterations, including zeros for iterations in which the feature was not selected
+  median_beta <- apply(coef_mat, 1, median)
+  
+  # Directional consistency among selected features
+  # Proportion of non-zero coefficients that were positive 
+  prop_positive <- apply(coef_mat, 1, function(x) {
+    nz <- get_nz(x)
+    if (length(nz) == 0) return(NA_real_)
+    mean(nz > 0)
+  })
+  
+  # Proportion of non-zero coefficients that were negative 
+  prop_negative <- apply(coef_mat, 1, function(x) {
+    nz <- get_nz(x)
+    if (length(nz) == 0) return(NA_real_)
+    mean(nz < 0)
+  })
+  
+  # Classify each feature according to the direction of its coefficient 
+  class <- ifelse(!is.na(prop_positive) & prop_positive >= sign_thresh, "positive",
+                  ifelse(!is.na(prop_negative) & prop_negative >= sign_thresh, "negative",
+                         "unstable"))
+  
+  # Combine 
+  out <- data.frame(
+    feature = all_feats,
+    selection_frequency = selection_frequency,
+    median_beta = median_beta,
+    prop_positive = prop_positive,
+    prop_negative = prop_negative,
+    class = class,
+    row.names = NULL
+  )
+  
+  # Order features from the highest to lowest selection frequency
+  out[order(-out$selection_frequency), ]
+}
+
+
+print("# Run function on list of coefficients")
+
+coef_summary <- summarize_coefs(coefs_ls, sign_thresh=0.9)
+
+sel_feats <- subset(coef_summary, selection_frequency >= 0.9 & !class=="unstable") %>% 
+  arrange(class, desc(median_beta)) %>% 
+  pull(feature)
+
+
+idx <-  1:100 
+coef_mat <- matrix(0, nrow = length(idx), ncol = length(sel_feats),
+                   dimnames = list(NULL, sel_feats))
+
+for (j in seq_along(idx)) {
+  r <- idx[j]
+  b <- coefs_ls[[r]] 
+  b <- b[names(b) != "(Intercept)"]  
+  common <- intersect(names(b), sel_feats)
+  coef_mat[j, common] <- b[common]
+}
+
+# Final coefficients: means across all iterations, including zeros when an SGB was not selected     
+avg_coefs <- colMeans(coef_mat)
+
+```
+
+```{r}
+
+print("# Compute risk score for all individuals")
+
+# This assumes the order of the roes of microbiome_ftbl are the same as in meta_case_control
+
+X_dev <- (as.matrix(microbiome_ftbl[, sel_feats, drop = FALSE]) > 0) * 1L
+lp_ll_dev <- as.numeric(X_dev %*% avg_coefs)
+mu_lp_ll_dev <- mean(lp_ll_dev)
+sd_lp_ll_dev <- sd(lp_ll_dev)
+
+
+plot_df <-
+  meta_case_control %>% 
+  dplyr::mutate(
+    risk_score = ((lp_ll_dev-mu_lp_ll_dev)/sd_lp_ll_dev),
+    risk_group = factor(ifelse(risk_score > median(risk_score), "High", "Low"), levels=c("Low","High")),
+    time_to_event_yr = time_to_event / 365.25
+  )
+
+print("# Plot Kaplan-Meier survival curves")
+
+km_plot <- survfit2(Surv(time_to_event_yr, event) ~ risk_group, data = plot_df) %>% 
+  ggsurvfit(linewidth=2) +
+  add_confidence_interval() +
+  add_censor_mark(color="black", size=1, shape=3) +
+  add_risktable(risktable_stats = "n.risk") +
+  add_pvalue("annotation", size = 5) +
+  scale_color_manual(values=c("Low"="forestgreen", "High"="red3")) +
+  scale_fill_manual(values=c("Low"="forestgreen", "High"="red3")) +
+  theme(
+    legend.position = "none",
+    legend.text=element_text(size=15, color="black"),
+    strip.background=element_blank(),
+    strip.text=element_text(size=15, color="black"),
+    panel.grid.major=element_blank(), 
+    panel.grid.minor=element_blank(), 
+    panel.background=element_rect(fill="white"),
+    panel.border=element_rect(colour="black", fill=NA, size=1),
+    plot.title=element_text(size=18, color="black"),
+    axis.title=element_text(size=18, color="black"),
+    axis.text.y=element_text(size=15,color="black"),
+    axis.text.x=element_text(size=15,color="black")) + 
+  labs(x="Time in years", y="Probability of remaining cancer-free")
+
+ggsave("results/km_plot.png", plot=km_plot, width=6, height=4, units="in", dpi=300) 
+
+
+print("# Impute and normalize risk factors for Cox regression")
+
+plot_df <- plot_df %>%
+  dplyr::mutate(
+    # Convert categorical variables to factors
+    dplyr::across(
+      c(ANTHRO.Sex,
+        EXP.SMOKING.Smoker.OneYear.Ever,
+        MED.DISEASES.None.No.Diseases),
+      as.factor
+    ),
+    # Replace missing values with the variable median
+    dplyr::across(
+      c(META.POOP.BristolMean,
+        EXP.DIET.Scores.LLDietScore),
+      ~ tidyr::replace_na(.x, median(.x, na.rm = TRUE))
+    ),
+    # Mean-center without scaling the standard deviation
+    dplyr::across(
+      c(ANTHRO.AGE, ANTHRO.BMI),
+      ~ .x - mean(.x, na.rm = TRUE)
+    )
+  )
+
+print("# Run a multivariable Cox PH model")
+
+cox_m <- coxph(
+  Surv(time_to_event, event) ~ 
+    risk_score + 
+    ANTHRO.Sex + 
+    ANTHRO.AGE + 
+    ANTHRO.BMI + 
+    MED.DISEASES.None.No.Diseases + 
+    EXP.SMOKING.Smoker.OneYear.Ever + 
+    META.POOP.BristolMean + 
+    EXP.DIET.Scores.LLDietScore, 
+  data = plot_df
+)
+
+cox_m_tidy <- tidy(cox_m)
+write.csv(cox_m_tidy, file = "results/cox_model.csv")
+
+```
+q('no')
